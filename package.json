@@ -1,6 +1,6 @@
 {
 	"name": "@clementprevot/pi-session-archive",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Pi extension that archives finished sessions out of /resume without deleting them, with a browsable picker to restore and resume them",
 	"keywords": [
 		"pi-package",
