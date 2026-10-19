@@ -45,9 +45,14 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const ARCHIVE_TAG = "[ARCHIVE] ";
+const RESTORE_AND_RESUME = "Restore and resume";
+const RESUME_KEEP_ARCHIVED = "Resume, keep archived";
+const RESTORE_ONLY = "Restore only";
+const RESUME_LIVE_COPY = "Resume the live copy";
+const CANCEL = "Cancel";
 const MAX_VISIBLE = 12;
 
 type Scope = "current" | "all";
@@ -121,7 +126,7 @@ export function relativeTime(date: Date): string {
 
 /**
  * Strip the [ARCHIVE] tag from the last session_info name, editing the file
- * in place (temp file + rename so a crash cannot truncate it). Restore-only
+ * in place (temp file + rename so a crash cannot truncate it). Restoring
  * needs this: a restored file that keeps the tag would be re-archived on its
  * next close by the self-heal logic. Best effort; the move already succeeded.
  */
@@ -155,6 +160,56 @@ function filesDiffer(a: string, b: string): boolean {
 	}
 }
 
+export function sessionIdFromFile(file: string): string {
+	return basename(file, ".jsonl").split("_").pop() ?? "";
+}
+
+function parentSessionId(metaFile: string): string | undefined {
+	try {
+		return JSON.parse(readFileSync(metaFile, "utf8")).parentSessionId;
+	} catch {
+		return undefined;
+	}
+}
+
+const SUBAGENT_ARTIFACT_SUFFIX = /^_(?:input\.md|output\.md|meta\.json|transcript\.jsonl)$/;
+
+/**
+ * Paths, relative to a per-cwd sessions dir, that belong to a session beside its
+ * file: its `<file>/` dir (subagent runs, forks), its subagent-artifacts runs, and its agent-browser screenshots.
+ */
+export function findCompanions(dir: string, file: string): string[] {
+	const id = sessionIdFromFile(file);
+	const found = [basename(file, ".jsonl"), join(".pi-agent-browser-artifacts", id)].filter((rel) =>
+		existsSync(join(dir, rel)),
+	);
+	const artifactsDir = join(dir, "subagent-artifacts");
+	if (!existsSync(artifactsDir)) return found;
+	const names = readdirSync(artifactsDir);
+	for (const meta of names.filter((name) => name.endsWith("_meta.json"))) {
+		if (parentSessionId(join(artifactsDir, meta)) !== id) continue;
+		const run = meta.slice(0, -"_meta.json".length);
+		for (const name of names) {
+			if (name.startsWith(run) && SUBAGENT_ARTIFACT_SUFFIX.test(name.slice(run.length))) {
+				found.push(join("subagent-artifacts", name));
+			}
+		}
+	}
+	return found;
+}
+
+/** Best effort: a companion whose destination already exists stays where it is. */
+export function moveCompanions(fromDir: string, toDir: string, file: string): void {
+	for (const rel of findCompanions(fromDir, file)) {
+		const target = join(toDir, rel);
+		if (existsSync(target)) continue;
+		try {
+			mkdirSync(dirname(target), { recursive: true });
+			renameSync(join(fromDir, rel), target);
+		} catch {}
+	}
+}
+
 function parseEntries(file: string): { id?: string; parentId?: string | null; type?: string }[] {
 	return readFileSync(file, "utf8")
 		.split("\n")
@@ -184,6 +239,28 @@ export function appendIfContinuation(fragment: string, archived: string): boolea
 	appendFileSync(archived, separator + readFileSync(fragment, "utf8"));
 	unlinkSync(fragment);
 	return true;
+}
+
+function indexKeyOf(index: Record<string, IndexEntry>, archivedFile: string): string | undefined {
+	return Object.keys(index).find((key) => join(archiveRoot(), key) === archivedFile);
+}
+
+/**
+ * With `keepTag`, the session keeps its [ARCHIVE] tag and goes back to the archive when it closes.
+ */
+export function restoreArchived(archivedFile: string, targetDir: string, keepTag: boolean): string {
+	mkdirSync(targetDir, { recursive: true });
+	const target = join(targetDir, basename(archivedFile));
+	renameSync(archivedFile, target);
+	moveCompanions(dirname(archivedFile), targetDir, archivedFile);
+	const index = readIndex();
+	const rel = indexKeyOf(index, archivedFile);
+	if (rel) {
+		delete index[rel];
+		writeIndex(index);
+	}
+	if (!keepTag) stripTagInFile(target);
+	return target;
 }
 
 /**
@@ -428,7 +505,7 @@ export default function sessionArchive(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("archives", {
-		description: "Browse archived sessions; selecting one moves it back and resumes it",
+		description: "Browse archived sessions; restore one, resume it, or both",
 		handler: async (_args, ctx) => {
 			const loaded = await loadArchivedSessions();
 			if (!loaded) {
@@ -466,44 +543,43 @@ export default function sessionArchive(pi: ExtensionAPI) {
 				ctx.ui.notify("Archived file no longer on disk", "warning");
 				return;
 			}
-			const rel = Object.keys(index).find((key) => join(archiveRoot(), key) === archivedFile);
+			const rel = indexKeyOf(index, archivedFile);
 			const cwd = chosen.cwd || headerCwd(archivedFile) || (rel ? index[rel]?.cwd : undefined);
 			if (!cwd) {
 				ctx.ui.notify("Session header unreadable; resume it with: pi --session <file>", "warning");
 				return;
 			}
 
-			// Move back into the live sessions tree, in the cwd dir it was born in.
 			const targetDir = join(getAgentDir(), "sessions", cwdDirName(cwd));
-			mkdirSync(targetDir, { recursive: true });
 			const target = join(targetDir, basename(archivedFile));
-			const liveCopyExists = existsSync(target);
-			if (liveCopyExists) {
+			if (existsSync(target)) {
 				// The session file already exists in the live tree (e.g. the session
 				// kept running after an archive attempt). Resume that copy and leave
 				// the archived one plus its index entry; the next shutdown of the
 				// live copy supersedes the stale archive.
-				ctx.ui.notify("Live copy of this session already exists; archived copy left in place", "info");
-			} else {
-				renameSync(archivedFile, target);
-
-				const nextIndex = readIndex();
-				if (rel) delete nextIndex[rel];
-				writeIndex(nextIndex);
-
-				ctx.ui.notify("Restored to /resume", "info");
-			}
-			const action = await ctx.ui.select(liveCopyExists ? "Live copy found; resume it?" : "Session restored to /resume", [
-				"Resume it now",
-				"Stay in the current session",
-			]);
-			if (action === "Resume it now") {
-				ctx.ui.notify("Resuming; the [ARCHIVE] tag drops on load", "info");
-				await ctx.switchSession(target);
+				const action = await ctx.ui.select("A live copy of this session exists; the archived copy stays in place", [
+					RESUME_LIVE_COPY,
+					CANCEL,
+				]);
+				if (action === RESUME_LIVE_COPY) await ctx.switchSession(target);
 				return;
 			}
-			stripTagInFile(target);
-			ctx.ui.notify("Left in /resume without the tag", "info");
+
+			const action = await ctx.ui.select(`${cleanName(chosen.name)}: what now?`, [
+				RESTORE_AND_RESUME,
+				RESUME_KEEP_ARCHIVED,
+				RESTORE_ONLY,
+				CANCEL,
+			]);
+			if (action === undefined || action === CANCEL) return;
+
+			restoreArchived(archivedFile, targetDir, action === RESUME_KEEP_ARCHIVED);
+			if (action === RESTORE_ONLY) {
+				ctx.ui.notify("Restored to /resume", "info");
+				return;
+			}
+			if (action === RESUME_KEEP_ARCHIVED) ctx.ui.notify("Resuming; back to the archive when it closes", "info");
+			await ctx.switchSession(target);
 		},
 	});
 
@@ -537,6 +613,7 @@ export default function sessionArchive(pi: ExtensionAPI) {
 			renameSync(target, `${target}.superseded-${Date.now()}`);
 		}
 		if (existsSync(file)) renameSync(file, target);
+		moveCompanions(dirname(file), dir, file);
 
 		const rel = join(cwdDirName(cwd), basename(file));
 		const index = readIndex();
