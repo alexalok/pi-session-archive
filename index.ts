@@ -34,7 +34,17 @@ import {
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, join, resolve } from "node:path";
 
 const ARCHIVE_TAG = "[ARCHIVE] ";
@@ -143,6 +153,37 @@ function filesDiffer(a: string, b: string): boolean {
 	} catch {
 		return true;
 	}
+}
+
+function parseEntries(file: string): { id?: string; parentId?: string | null; type?: string }[] {
+	return readFileSync(file, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => {
+			try {
+				return JSON.parse(line);
+			} catch {
+				return {};
+			}
+		});
+}
+
+/**
+ * A headerless file at the live path is the tail pi kept writing after an
+ * earlier move: append it to the archived copy when all its entries chain onto it.
+ */
+export function appendIfContinuation(fragment: string, archived: string): boolean {
+	const tail = parseEntries(fragment);
+	if (tail.length === 0 || tail[0].type === "session") return false;
+	const archivedIds = new Set(parseEntries(archived).map((entry) => entry.id));
+	const tailIds = new Set(tail.map((entry) => entry.id));
+	const parents = tail.map((entry) => entry.parentId).filter((id): id is string => typeof id === "string");
+	if (!parents.some((id) => archivedIds.has(id))) return false;
+	if (!parents.every((id) => archivedIds.has(id) || tailIds.has(id))) return false;
+	const separator = readFileSync(archived, "utf8").endsWith("\n") ? "" : "\n";
+	appendFileSync(archived, separator + readFileSync(fragment, "utf8"));
+	unlinkSync(fragment);
+	return true;
 }
 
 /**
@@ -479,20 +520,23 @@ export default function sessionArchive(pi: ExtensionAPI) {
 		archiveOnShutdown = Boolean(pi.getSessionName()?.startsWith(ARCHIVE_TAG));
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", (event, ctx) => {
 		if (!archiveOnShutdown) return;
+		// A reload keeps this session running on the same file; moving it now
+		// makes pi recreate a headerless tail at the old path.
+		if (event.reason === "reload") return;
 		const file = ctx.sessionManager.getSessionFile();
-		if (!file) return;
+		if (!file || event.targetSessionFile === file) return;
 		const cwd = headerCwd(file) ?? ctx.sessionManager.getCwd();
 		const dir = join(archiveRoot(), cwdDirName(cwd));
 		mkdirSync(dir, { recursive: true });
 		const target = join(dir, basename(file));
-		if (existsSync(target) && filesDiffer(file, target)) {
+		if (existsSync(target) && filesDiffer(file, target) && !appendIfContinuation(file, target)) {
 			// A stale copy (e.g. left by a restore that found the file already live)
 			// must not silently block the move forever.
 			renameSync(target, `${target}.superseded-${Date.now()}`);
 		}
-		renameSync(file, target);
+		if (existsSync(file)) renameSync(file, target);
 
 		const rel = join(cwdDirName(cwd), basename(file));
 		const index = readIndex();

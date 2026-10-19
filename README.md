@@ -15,11 +15,11 @@ Updates ship with `pi update --extensions`. The extension applies to your next s
 Archiving is deliberately two-phase, so nothing is pulled from under the live session manager:
 
 1. On archive (agent tool, `/archive`, or the picker), the session is only renamed with an `[ARCHIVE]` tag. It still runs normally.
-2. When the session closes (`session_shutdown`), the file physically moves out of pi's sessions tree into `~/.pi/agent/sessions-archive/`, in a per-cwd subdirectory. An `index.json` there records the original name, cwd, and archive date.
+2. When the session closes (`session_shutdown`), the file physically moves out of pi's sessions tree into `~/.pi/agent/sessions-archive/`, in a per-cwd subdirectory. An `index.json` there records the original name, cwd, and archive date. A `/reload` is not a close: the session keeps running on the same file, so nothing moves.
 
 `/archives` opens a scrollable picker over that tree: type to filter on name or first message, tab toggles scope (current directory vs all, like `/resume`), ctrl+s toggles sort (archive date vs name). Selecting an entry moves the file back into the per-cwd sessions directory, strips the `[ARCHIVE]` tag (temp file plus rename, so a crash cannot truncate the file), and offers to resume it right away.
 
-A tagged session that never got moved (crash before shutdown) re-arms the move on its next start, and a session resumed straight from the archive dir sheds the tag.
+A tagged session that never got moved (crash before shutdown) re-arms the move on its next start, and a session resumed straight from the archive dir sheds the tag. If pi wrote a few more entries after an earlier move, the headerless tail it left behind is appended to the archived copy instead of replacing it.
 
 ## Configuration
 
