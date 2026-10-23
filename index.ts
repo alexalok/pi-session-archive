@@ -19,6 +19,7 @@ import {
 	getSelectListTheme,
 	SessionManager,
 	type ExtensionAPI,
+	type ExtensionContext,
 	type SessionInfo,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -46,6 +47,13 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import {
+	assertSessionNotActive,
+	canonicalSessionFile,
+	trackSession,
+	untrackSession,
+	type SessionPresence,
+} from "./activity.ts";
 
 const ARCHIVE_TAG = "[ARCHIVE] ";
 const RESTORE_AND_RESUME = "Restore and resume";
@@ -161,7 +169,8 @@ function filesDiffer(a: string, b: string): boolean {
 }
 
 export function sessionIdFromFile(file: string): string {
-	return basename(file, ".jsonl").split("_").pop() ?? "";
+	const name = basename(file, ".jsonl");
+	return name.slice(name.indexOf("_") + 1);
 }
 
 function parentSessionId(metaFile: string): string | undefined {
@@ -475,8 +484,36 @@ async function loadArchivedSessions(): Promise<{ sessions: SessionInfo[]; archiv
 	return sessions.length > 0 ? { sessions, archiveDates } : null;
 }
 
+/** Shared move path: explicit targets never overwrite an existing archive. */
+function moveSessionToArchive(file: string, cwd: string, name: string | undefined, replaceStale = false): void {
+	const dir = join(archiveRoot(), cwdDirName(cwd));
+	mkdirSync(dir, { recursive: true });
+	const target = join(dir, basename(file));
+	if (existsSync(target)) {
+		if (!replaceStale) throw new Error("An archived copy already exists; nothing was archived.");
+		if (filesDiffer(file, target) && !appendIfContinuation(file, target)) {
+			renameSync(target, `${target}.superseded-${Date.now()}`);
+		}
+	}
+	if (existsSync(file)) renameSync(file, target);
+	moveCompanions(dirname(file), dir, file);
+
+	const index = readIndex();
+	index[join(cwdDirName(cwd), basename(file))] = {
+		name: (name ?? "").replace(ARCHIVE_TAG, "").trim() || "(unnamed)",
+		cwd,
+		archivedAt: new Date().toISOString(),
+	};
+	writeIndex(index);
+}
+
+// Match Pi's full-ID grammar, including custom IDs. Never treat input as a
+// path, session name, UUID prefix, or search query.
+const SESSION_ID_PATTERN = "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$";
+
 export default function sessionArchive(pi: ExtensionAPI) {
 	let archiveOnShutdown = false;
+	let presence: SessionPresence | undefined;
 
 	function archive(ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } }): string {
 		pi.setSessionName(tagged(pi.getSessionName()));
@@ -486,21 +523,76 @@ export default function sessionArchive(pi: ExtensionAPI) {
 		return message;
 	}
 
+	async function archiveById(sessionId: string | undefined, ctx: ExtensionContext, signal?: AbortSignal): Promise<string> {
+		signal?.throwIfAborted();
+		if (sessionId === undefined) return archive(ctx);
+		if (!new RegExp(SESSION_ID_PATTERN).test(sessionId)) {
+			throw new Error("Use one complete session ID, not a name, path, or ID prefix.");
+		}
+		const isCurrent = sessionId === ctx.sessionManager.getSessionId();
+
+		// Include the current session directory for --session-dir users; deduplicate
+		// paths also returned by the normal all-directory discovery.
+		const sessions = [
+			...await SessionManager.listAll(),
+			...await SessionManager.listAll(ctx.sessionManager.getSessionDir()),
+		];
+		signal?.throwIfAborted();
+		const matches = new Map<string, SessionInfo>();
+		for (const session of sessions) {
+			if (session.id === sessionId) matches.set(canonicalSessionFile(session.path), session);
+		}
+		if (isCurrent) {
+			const currentFile = ctx.sessionManager.getSessionFile();
+			const canonical = currentFile ? canonicalSessionFile(currentFile) : undefined;
+			if ([...matches.keys()].some((file) => file !== canonical)) {
+				throw new Error(`Multiple session files have ID ${sessionId}; nothing was archived.`);
+			}
+			// New sessions may not have been flushed to disk yet.
+			return archive(ctx);
+		}
+		if (matches.size === 0) throw new Error(`No saved session with exact ID ${sessionId}.`);
+		if (matches.size !== 1) throw new Error(`Multiple session files have ID ${sessionId}; nothing was archived.`);
+		const [file, session] = [...matches][0];
+
+		// Do not await between the final activity check and moving the file.
+		assertSessionNotActive(archiveRoot(), file);
+		const header = JSON.parse(readFileSync(file, "utf8").split("\n")[0]);
+		if (header.type !== "session" || header.id !== sessionId || typeof header.cwd !== "string" || !header.cwd) {
+			throw new Error("Session header changed or is invalid; nothing was archived.");
+		}
+		moveSessionToArchive(file, header.cwd, session.name);
+		const message = `Archived session ${sessionId}. Browse it with /archives.`;
+		ctx.ui.notify(message, "info");
+		return message;
+	}
+
 	pi.registerTool({
 		name: "archive_session",
 		label: "Archive session",
 		description:
-		"Archive the current session when the user says the work on it is done (\"we're done\", \"archive this session\"). Tags it [ARCHIVE] and moves it out of /resume once the session closes. Takes no arguments.",
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			return { content: [{ type: "text", text: archive(ctx) }], details: {} };
+		"Archive a session at the user's request. Omit sessionId to tag the current session for archiving on close. " +
+		"Supply a complete sessionId to archive another saved session immediately; names, paths, and ID prefixes are not accepted. " +
+		"Refuses sessions recorded as open by this extension, even if idle. Do not target a session open in a process without this extension.",
+		parameters: Type.Object({
+			sessionId: Type.Optional(Type.String({
+				pattern: SESSION_ID_PATTERN,
+				description: "Complete, exact session ID (not a name, path, or prefix). Omit for the current session.",
+			})),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			return { content: [{ type: "text", text: await archiveById(params.sessionId, ctx, signal) }], details: {} };
 		},
 	});
 
 	pi.registerCommand("archive", {
-		description: "Archive the current session (tag + move out of /resume on close)",
-		handler: async (_args, ctx) => {
-			archive(ctx);
+		description: "Archive the current session on close, or /archive <session-id> for another closed session",
+		handler: async (args, ctx) => {
+			try {
+				await archiveById(args.trim() || undefined, ctx);
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
 		},
 	});
 
@@ -587,6 +679,7 @@ export default function sessionArchive(pi: ExtensionAPI) {
 	// move; a session resumed straight from the archive dir sheds the tag.
 	pi.on("session_start", (_event, ctx) => {
 		const file = ctx.sessionManager.getSessionFile() ?? "";
+		if (file) presence = trackSession(ctx.sessionManager, archiveRoot(), file);
 		if (file.startsWith(archiveRoot())) {
 			const name = pi.getSessionName();
 			if (name?.startsWith(ARCHIVE_TAG)) pi.setSessionName(name.slice(ARCHIVE_TAG.length));
@@ -597,31 +690,17 @@ export default function sessionArchive(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (event, ctx) => {
-		if (!archiveOnShutdown) return;
-		// A reload keeps this session running on the same file; moving it now
-		// makes pi recreate a headerless tail at the old path.
+		// Keep both the file and its presence record across /reload.
 		if (event.reason === "reload") return;
 		const file = ctx.sessionManager.getSessionFile();
-		if (!file || event.targetSessionFile === file) return;
-		const cwd = headerCwd(file) ?? ctx.sessionManager.getCwd();
-		const dir = join(archiveRoot(), cwdDirName(cwd));
-		mkdirSync(dir, { recursive: true });
-		const target = join(dir, basename(file));
-		if (existsSync(target) && filesDiffer(file, target) && !appendIfContinuation(file, target)) {
-			// A stale copy (e.g. left by a restore that found the file already live)
-			// must not silently block the move forever.
-			renameSync(target, `${target}.superseded-${Date.now()}`);
+		try {
+			if (!archiveOnShutdown || !file || event.targetSessionFile === file || !existsSync(file)) return;
+			// The same transcript may be open in another process or SDK session.
+			assertSessionNotActive(archiveRoot(), file, presence?.marker);
+			moveSessionToArchive(file, headerCwd(file) ?? ctx.sessionManager.getCwd(), pi.getSessionName(), true);
+		} finally {
+			untrackSession(ctx.sessionManager);
+			presence = undefined;
 		}
-		if (existsSync(file)) renameSync(file, target);
-		moveCompanions(dirname(file), dir, file);
-
-		const rel = join(cwdDirName(cwd), basename(file));
-		const index = readIndex();
-		index[rel] = {
-			name: (pi.getSessionName() ?? "").replace(ARCHIVE_TAG, "").trim() || "(unnamed)",
-			cwd,
-			archivedAt: new Date().toISOString(),
-		};
-		writeIndex(index);
 	});
 }
