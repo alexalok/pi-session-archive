@@ -54,6 +54,7 @@ import {
 	untrackSession,
 	type SessionPresence,
 } from "./activity.ts";
+import { movePath } from "./file-move.ts";
 
 const ARCHIVE_TAG = "[ARCHIVE] ";
 const RESTORE_AND_RESUME = "Restore and resume";
@@ -214,7 +215,7 @@ export function moveCompanions(fromDir: string, toDir: string, file: string): vo
 		if (existsSync(target)) continue;
 		try {
 			mkdirSync(dirname(target), { recursive: true });
-			renameSync(join(fromDir, rel), target);
+			movePath(join(fromDir, rel), target);
 		} catch {}
 	}
 }
@@ -269,7 +270,7 @@ export function restoreArchived(archivedFile: string, targetDir: string, keepTag
 	}
 	mkdirSync(targetDir, { recursive: true });
 	const target = join(targetDir, basename(archivedFile));
-	renameSync(archivedFile, target);
+	movePath(archivedFile, target);
 	moveCompanions(dirname(archivedFile), targetDir, archivedFile);
 	const index = readIndex();
 	const rel = indexKeyOf(index, archivedFile);
@@ -504,7 +505,7 @@ function moveSessionToArchive(file: string, cwd: string, name: string | undefine
 			renameSync(target, `${target}.superseded-${Date.now()}`);
 		}
 	}
-	if (existsSync(file)) renameSync(file, target);
+	if (existsSync(file)) movePath(file, target);
 	moveCompanions(dirname(file), dir, file);
 
 	const index = readIndex();

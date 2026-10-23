@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -135,6 +135,47 @@ test("lookup includes the current custom session directory", async () => {
 	const file = seed(OTHER, CWD, "Other", dir);
 	await current.archive(OTHER);
 	assert.ok(existsSync(archived(file)));
+});
+
+test("exact-ID archive and restore move transcripts and companions across filesystems", async (t) => {
+	let dir: string;
+	try {
+		dir = mkdtempSync("/dev/shm/pi-archive-cross-device-");
+	} catch {
+		t.skip("No writable second filesystem; cross-device fallback is also covered by unit tests");
+		return;
+	}
+	try {
+		if (statSync(dir).dev === statSync(root).dev) {
+			t.skip("Temporary directories are on the same filesystem");
+			return;
+		}
+		const current = load(seed(CURRENT, CWD, "Current", dir));
+		const file = seed(OTHER, CWD, "Other", dir);
+		const before = readFileSync(file, "utf8");
+		const companion = basename(file, ".jsonl");
+		mkdirSync(join(dir, companion, "nested"), { recursive: true });
+		writeFileSync(join(dir, companion, "nested", "artifact.txt"), "keep me");
+		mkdirSync(join(dir, "subagent-artifacts"));
+		writeFileSync(join(dir, "subagent-artifacts", "run_meta.json"), JSON.stringify({ parentSessionId: OTHER }));
+		writeFileSync(join(dir, "subagent-artifacts", "run_output.md"), "result");
+
+		await current.archive(OTHER);
+		assert.equal(existsSync(file), false);
+		assert.equal(existsSync(join(dir, companion)), false);
+		assert.equal(existsSync(join(dir, "subagent-artifacts", "run_output.md")), false);
+		assert.equal(readFileSync(archived(file), "utf8"), before);
+		assert.equal(readFileSync(join(dirname(archived(file)), companion, "nested", "artifact.txt"), "utf8"), "keep me");
+		assert.equal(readFileSync(join(dirname(archived(file)), "subagent-artifacts", "run_output.md"), "utf8"), "result");
+
+		const restored = restoreArchived(archived(file), dir, false);
+		assert.equal(readFileSync(restored, "utf8"), before);
+		assert.equal(existsSync(archived(file)), false);
+		assert.equal(readFileSync(join(dir, companion, "nested", "artifact.txt"), "utf8"), "keep me");
+		assert.equal(readFileSync(join(dir, "subagent-artifacts", "run_output.md"), "utf8"), "result");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("custom session IDs, including underscores, retain their companions", async () => {

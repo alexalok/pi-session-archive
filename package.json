@@ -20,7 +20,8 @@
 	},
 	"files": [
 		"index.ts",
-		"activity.ts"
+		"activity.ts",
+		"file-move.ts"
 	],
 	"pi": {
 		"extensions": [

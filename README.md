@@ -16,7 +16,7 @@ Updates ship with `pi update --extensions`. The extension applies to your next s
 - `/archive <session-id>` or `archive_session({ "sessionId": "<session-id>" })`: archive another saved session immediately, without switching chats. Its transcript and companions move together and remain available in `/archives`.
 - Passing the current session's ID keeps the deferred, archive-on-close behavior.
 
-Targets must be **complete, exact session IDs**, including custom IDs supported by Pi. Names, paths, ID prefixes, search queries, and multiple IDs in one call are not accepted. Get the current ID with `/session`, or read the `id` in a saved session's JSONL header. Lookup covers Pi's normal sessions tree and the current session directory (for `--session-dir`). Missing or duplicate IDs are refused, never interpreted as the current session. An existing archived copy is not overwritten.
+Targets must be **complete, exact session IDs**, including custom IDs supported by Pi. Names, paths, ID prefixes, search queries, and multiple IDs in one call are not accepted. Get the current ID with `/session`, or read the `id` in a saved session's JSONL header. Lookup covers Pi's normal sessions tree and the current session directory (for `--session-dir`). Missing or duplicate IDs are refused, never interpreted as the current session. An existing archived copy is not overwritten. Cross-filesystem moves use a staged copy on the destination filesystem before removing the source, for both transcripts and companions.
 
 ### Protecting open sessions
 
