@@ -19,7 +19,9 @@
 		"node": ">=22.6"
 	},
 	"files": [
-		"index.ts"
+		"index.ts",
+		"activity.ts",
+		"file-move.ts"
 	],
 	"pi": {
 		"extensions": [
