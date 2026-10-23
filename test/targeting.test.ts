@@ -5,9 +5,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import sessionArchive, { cwdDirName } from "../index.ts";
+import sessionArchive, { cwdDirName, restoreArchived } from "../index.ts";
 import { registerSessionPresence } from "../activity.ts";
 
 const CURRENT = "01a0aaaa-0000-7000-8000-000000000001";
@@ -42,11 +42,11 @@ type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 type Handler = (event: Record<string, unknown>, ctx: ExtensionContext) => unknown;
 
-function load(file = seed(CURRENT), id = CURRENT, manager?: ExtensionContext["sessionManager"]) {
+function load(file = seed(CURRENT), id = CURRENT, manager?: ExtensionContext["sessionManager"], initialName = "Current chat") {
 	const commands = new Map<string, Command>();
 	const handlers = new Map<string, Handler>();
 	let tool: Tool;
-	let name = "Current chat";
+	let name = initialName;
 	const notices: { text: string; type?: string }[] = [];
 	const ctx = {
 		cwd: CWD,
@@ -105,6 +105,20 @@ test("the agent archives another exact ID, preserving its contents, name, and co
 	assert.ok(existsSync(current.file));
 	const index = JSON.parse(readFileSync(join(root, "sessions-archive", "index.json"), "utf8"));
 	assert.equal(Object.values<{ name: string }>(index)[0].name, "Finished work");
+});
+
+test("an exact-ID archive restored with keep-archived returns to the archive on close", async () => {
+	const file = seed();
+	const before = readFileSync(file, "utf8");
+	await load().archive(OTHER);
+	const restored = restoreArchived(archived(file), dirname(file), true);
+	assert.ok(readFileSync(restored, "utf8").startsWith(before));
+	const manager = SessionManager.open(restored);
+	assert.equal(manager.getSessionName(), "[ARCHIVE] Finished work");
+	const resumed = load(restored, OTHER, manager, manager.getSessionName());
+	resumed.emit("session_shutdown", "quit");
+	assert.equal(existsSync(restored), false);
+	assert.ok(existsSync(archived(file)));
 });
 
 test("/archive ID finds sessions in a different working directory", async () => {

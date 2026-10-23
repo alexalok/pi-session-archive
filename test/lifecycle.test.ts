@@ -190,11 +190,11 @@ const archiveDir = () => join(agentDir, "sessions-archive", cwdDirName(CWD));
 const archivedFile = () => join(archiveDir(), FILE);
 const indexFile = () => join(agentDir, "sessions-archive", "index.json");
 
-function seedArchive(): void {
+function seedArchive(name: string | null = "[ARCHIVE] done"): void {
 	writeLines(archivedFile(), [
 		header,
 		entry("a", null),
-		JSON.stringify({ type: "session_info", id: "n", parentId: "a", timestamp: "t", name: "[ARCHIVE] done" }),
+		...(name === null ? [] : [JSON.stringify({ type: "session_info", id: "n", parentId: "a", timestamp: "t", name })]),
 	]);
 	seedCompanions(archiveDir());
 	writeFileSync(indexFile(), JSON.stringify({ [join(cwdDirName(CWD), FILE)]: { name: "done", cwd: CWD, archivedAt: "t" } }));
@@ -263,6 +263,34 @@ test("Resume, keep archived keeps the tag, so closing sends the session back to 
 	assert.ok(existsSync(join(archiveDir(), FILE.replace(".jsonl", ""), "run-0", "session.jsonl")));
 	assert.ok(existsSync(join(archiveDir(), "subagent-artifacts", "run1_reviewer_output.md")));
 });
+
+for (const name of ["done", 'quoted "name"', null, "[ARCHIVE]"]) {
+	test(`Resume, keep archived adds a durable tag to ${JSON.stringify(name)} and re-archives on close`, async () => {
+		// Exact-ID archiving preserves the transcript, so archives can be untagged
+		// or have no session_info at all, unlike the original self-archive path.
+		seedArchive(name);
+		const { file, start, shutdown, switched } = await runArchives("Resume, keep archived");
+		assert.deepEqual(switched, [file]);
+		assert.equal(lastSessionName(file), `[ARCHIVE] ${name === null || name === "[ARCHIVE]" ? "(unnamed)" : name}`);
+		assert.ok(readFileSync(file, "utf8").includes(entry("a", null)));
+
+		start();
+		shutdown({ reason: "quit" });
+		assert.equal(existsSync(file), false);
+		assert.ok(existsSync(archivedFile()));
+	});
+}
+
+for (const action of ["Restore and resume", "Restore only"]) {
+	test(`${action} leaves an exact-ID archive untagged`, async () => {
+		seedArchive("done");
+		const { file, start, shutdown } = await runArchives(action);
+		assert.equal(lastSessionName(file), "done");
+		start();
+		shutdown({ reason: "quit" });
+		assert.ok(existsSync(file));
+	});
+}
 
 test("Restore only drops the tag without switching", async () => {
 	seedArchive();

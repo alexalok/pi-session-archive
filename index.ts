@@ -255,9 +255,18 @@ function indexKeyOf(index: Record<string, IndexEntry>, archivedFile: string): st
 }
 
 /**
- * With `keepTag`, the session keeps its [ARCHIVE] tag and goes back to the archive when it closes.
+ * With `keepTag`, ensure a durable [ARCHIVE] tag so closing re-archives the session,
+ * including exact-ID archives whose original transcripts were never tagged.
  */
 export function restoreArchived(archivedFile: string, targetDir: string, keepTag: boolean): string {
+	if (keepTag) {
+		const manager = SessionManager.open(archivedFile);
+		const name = manager.getSessionName();
+		const archiveName = tagged(!name || name === ARCHIVE_TAG.trim() ? "(unnamed)" : name);
+		// Use Pi's append-only metadata API; do not rewrite conversation entries.
+		// Tag before moving so a write failure cannot resume an untagged session.
+		if (name !== archiveName) manager.appendSessionInfo(archiveName);
+	}
 	mkdirSync(targetDir, { recursive: true });
 	const target = join(targetDir, basename(archivedFile));
 	renameSync(archivedFile, target);
